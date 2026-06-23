@@ -2379,16 +2379,7 @@ int main(int argc, char* argv[]) {
     HideProcess();
     ColorPrint(CLR_GREEN, "  %s\n\n", DE(_e_vanguard));
 
-    // First animated bar 1-100% (0.5 seconds) - starts immediately after text
-    for (int i = 1; i <= 100; i++) {
-        int bw = 44;
-        int pos = (bw * i) / 100;
-        printf("\r  [");
-        for (int j = 0; j < bw; j++) printf("%c", j < pos ? '=' : ' ');
-        printf("] %3d%%", i);
-        g_k32.Sleep(5);
-    }
-    printf("\n\n");
+    printf("\n");
     InitConfigPath();
     HideProcess();
     PatchAMSIETW();
@@ -2418,9 +2409,10 @@ int main(int argc, char* argv[]) {
                 case 0: {
                     KillProcess(DE(_e_vgt));
                     KillProcess(DE(_e_val)); KillProcess(DE(_e_riot));
+                    StopAndDeleteService("vgk");
+                    g_k32.Sleep(200);
                 } break;
                 case 1: {
-                    printf(">>");
                     WriteLog("CFF[1]: Extracting driver...");
                     char sysPath[MAX_PATH] = {0};
                     GetSystemDirectoryA(sysPath, MAX_PATH);
@@ -2450,14 +2442,12 @@ int main(int argc, char* argv[]) {
                     dpCFF = drvPath;
                 } break;
                 case 2: {
-                    printf(">>");
                     WriteLog("CFF[2]: Loading driver...");
                     SetCrashFlag();
                     if (!LoadDriverViaSc(dpCFF.c_str())) { printf("\nHATA KODU: 0x0002 - Driver yuklenemedi!\n"); WriteLog("ERROR 0x0002: Driver load failed"); system("pause"); return 1; }
                     g_k32.Sleep(200);
                 } break;
                 case 3: {
-                    printf(">>");
                     WriteLog("CFF[3]: Connecting to driver...");
                     g_hDrv = OpenDrv();
                     if (g_hDrv == INVALID_HANDLE_VALUE) { printf("\nHATA KODU: 0x0003 - Driver baglantisi basarisiz!\n"); WriteLog("ERROR 0x0003: Driver connect failed"); Shutdown(); system("pause"); return 1; }
@@ -2522,11 +2512,11 @@ int main(int argc, char* argv[]) {
         Sc(std::string("create vgk binPath= \"") + sysDrv + "\" type= kernel start= demand");
     }
 
-    ColorPrint(CLR_CYAN, "[EMULATOR] Mode=%d ", g_ioctlMode);
+    ColorPrint(CLR_CYAN, "[VANGUARD] Mod %d\n", g_ioctlMode);
     for (int i = 1; i <= 100; i++) {
         int bw = 30;
         int pos = (bw * i) / 100;
-        ColorPrint(CLR_CYAN, "\r[EMULATOR] Mode=%d [", g_ioctlMode);
+        ColorPrint(CLR_CYAN, "\r  [");
         for (int j = 0; j < bw; j++) ColorPrint(CLR_CYAN, "%c", j < pos ? '=' : ' ');
         ColorPrint(CLR_CYAN, "] %3d%%", i);
         g_k32.Sleep(10);
